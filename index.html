@@ -150,6 +150,12 @@
   .status{font-family:var(--f-mono);font-size:.75rem;letter-spacing:.04em;color:var(--ink-soft)}
   .status.good{color:var(--patina)}
   .status.bad{color:var(--oxide)}
+  #autosave{color:var(--patina);white-space:nowrap}
+  #autosave.warn{color:var(--brass)}
+  .resume{background:var(--surface-2);border-left:2px solid var(--patina);padding:1.1rem 1.2rem;margin:0 0 1.6rem}
+  .resume b{display:block;font-family:var(--f-display);font-size:.74rem;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--patina);margin-bottom:.45rem}
+  .resume p{margin:0 0 .85rem;font-size:.97rem;color:var(--ink-soft);max-width:60ch}
+  .resume input{font-family:var(--f-mono);font-size:.78rem;flex:1 1 18rem;background:var(--surface)}
   #out{min-height:9rem;font-family:var(--f-mono);font-size:.8rem;line-height:1.6;margin-top:1rem}
 
   footer{margin-top:4rem;padding-top:1.4rem;border-top:2px solid var(--ink);font-family:var(--f-mono);font-size:.7rem;letter-spacing:.05em;color:var(--ink-faint);line-height:1.8}
@@ -179,14 +185,15 @@
       <p>Each one has "Looks right" and "Not quite", and a box for anything to add or correct. Skip anything you are happy with.</p>
     </div>
     <div>
-      <b>Send it at the end</b>
-      <p>Your notes are kept on this page as you go. Press Send at the bottom when you are done and they come straight to us.</p>
+      <b>Nothing gets lost</b>
+      <p>Every answer saves by itself the moment you make it. Close the page, come back tomorrow, carry on where you stopped. Press Send at the end when you are finished.</p>
     </div>
   </div>
 
   <div class="tally">
     <span class="count"><b id="done">0</b> of <span id="total">0</span> commented on</span>
     <span class="bar"><i id="fill"></i></span>
+    <span class="count" id="autosave">Saved</span>
     <button class="btn ghost" id="jump">Go to send</button>
   </div>
 
@@ -195,6 +202,15 @@
   <section class="send" id="sendblock">
     <h2>Anything else, and send</h2>
     <p>Two open boxes before you send. Nothing here is compulsory.</p>
+
+    <div class="resume">
+      <b>Coming back later</b>
+      <p>Everything you have written is already saved, so you can close this and carry on whenever you like. To pick it up on a different phone or computer, keep this link. It is the only one that finds your answers.</p>
+      <div class="row">
+        <input type="text" id="resume" readonly aria-label="Your link back to these answers">
+        <button class="btn ghost" id="copylink">Copy link</button>
+      </div>
+    </div>
 
     <div class="field">
       <label for="extra1">Anything we have missed or got wrong overall</label>
@@ -379,19 +395,93 @@
     }
   ];
 
-  var KEY_LS = "badger-scope.v1";
+  var KEY_LS = "badger-scope.v3";
   var byRef = {}, order = [];
   PLATES.forEach(function(p){ (p.items||[]).forEach(function(it){ it.plate = p.ref; it.plateTitle = p.title; byRef[it.ref] = it; order.push(it.ref); }); });
 
+  /* ------------------------------------------------------------------
+     The review code. It is what finds her answers again, on this device
+     or any other, so it lives in the address bar as well as on the device.
+     ------------------------------------------------------------------ */
+  function newCode(){
+    var s = "", a = "abcdefghijkmnpqrstuvwxyz23456789";
+    var buf = new Uint8Array(20);
+    if(window.crypto && window.crypto.getRandomValues){ window.crypto.getRandomValues(buf); }
+    else { for(var j=0;j<20;j++) buf[j] = Math.floor(Math.random()*256); }
+    for(var i=0;i<20;i++) s += a[buf[i] % a.length];
+    return s;
+  }
+  function readCode(){
+    var m = /[#&?]r=([a-z0-9]{12,64})/i.exec(window.location.hash + window.location.search);
+    if(m) return m[1];
+    try { var c = localStorage.getItem(KEY_LS + ".code"); if(c) return c; } catch(e){}
+    return newCode();
+  }
+  var CODE = readCode();
+  try { localStorage.setItem(KEY_LS + ".code", CODE); } catch(e){}
+  if(window.history && window.history.replaceState){
+    window.history.replaceState(null, "", window.location.pathname + "#r=" + CODE);
+  }
+  var RESUME = window.location.origin + window.location.pathname + "#r=" + CODE;
+
+  /* ---- state, kept on the device as well as on the server ---- */
   var state = {};
-  try { state = JSON.parse(localStorage.getItem(KEY_LS) || "{}") || {}; } catch(e){ state = {}; }
-  function save(){ try { localStorage.setItem(KEY_LS, JSON.stringify(state)); } catch(e){} }
+  try { state = JSON.parse(localStorage.getItem(KEY_LS + "." + CODE) || "{}") || {}; } catch(e){ state = {}; }
+  function saveLocal(){ try { localStorage.setItem(KEY_LS + "." + CODE, JSON.stringify(state)); } catch(e){} }
+
+  /* ---- server ---- */
+  var saveEl = null, pending = 0, everFailed = false;
+  function setSaveState(text, warn){
+    if(!saveEl) saveEl = document.getElementById("autosave");
+    saveEl.textContent = text;
+    saveEl.className = "count" + (warn ? " warn" : "");
+  }
+  function rpc(fn, body){
+    return fetch(SB + "/rest/v1/rpc/" + fn, {
+      method: "POST",
+      headers: {"apikey": KEY, "Authorization": "Bearer " + KEY, "Content-Type": "application/json"},
+      body: JSON.stringify(body)
+    }).then(function(res){
+      if(!res.ok) throw new Error("HTTP " + res.status);
+      return res.status === 204 ? null : res.json();
+    });
+  }
+
+  var timers = {};
+  function syncItem(ref){
+    var it = byRef[ref];
+    var s = state[ref] || {};
+    var body = {
+      p_code: CODE,
+      p_item_ref: ref,
+      p_item_title: it ? it.title : (ref === "X1" ? "Missed or wrong overall" : (ref === "X2" ? "Other things you wanted" : "Name")),
+      p_section: it ? it.plateTitle : "Anything else",
+      p_verdict: s.v === "ok" ? "right" : (s.v === "no" ? "wrong" : ((s.note && s.note.trim()) ? "note" : null)),
+      p_note: (s.note || "").trim() || null,
+      p_author: ((state.__meta && state.__meta.who) || "").trim() || null
+    };
+    clearTimeout(timers[ref]);
+    timers[ref] = setTimeout(function(){
+      pending++;
+      setSaveState("Saving...");
+      rpc("badger_scope_save", body).then(function(){
+        pending--;
+        if(pending <= 0){ pending = 0; setSaveState(everFailed ? "Saved on this device" : "Saved", everFailed); }
+      }).catch(function(){
+        pending--; if(pending < 0) pending = 0;
+        everFailed = true;
+        setSaveState("Saved on this device", true);
+      });
+    }, 600);
+  }
 
   function esc(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
   function markFor(ref){
     var st = state[ref];
-    if(!st || !st.v) return "";
-    return st.v === "ok" ? '<span class="mark ok">&#10003; right</span>' : '<span class="mark no">&#9679; flagged</span>';
+    if(!st || (!st.v && !(st.note && st.note.trim()))) return "";
+    if(st.v === "ok") return '<span class="mark ok">&#10003; right</span>';
+    if(st.v === "no") return '<span class="mark no">&#9679; flagged</span>';
+    return '<span class="mark ok">&#10003; noted</span>';
   }
   function visLine(seen){
     var out = [];
@@ -429,6 +519,12 @@
     sec.innerHTML = html;
     root.appendChild(sec);
   });
+
+  function refreshMarks(){
+    Array.prototype.forEach.call(document.querySelectorAll("[data-mark]"), function(el){
+      el.innerHTML = markFor(el.getAttribute("data-mark"));
+    });
+  }
 
   /* ---- detail ---- */
   var openRef = null;
@@ -483,12 +579,13 @@
 
     var savedEl = det.querySelector("[data-saved]");
     function record(msg){
-      save();
+      saveLocal();
+      syncItem(ref);
       savedEl.textContent = msg;
       var slot = document.querySelector('[data-mark="' + ref + '"]');
       if(slot) slot.innerHTML = markFor(ref);
       tally();
-      dirty();
+      resetSendState();
     }
 
     Array.prototype.forEach.call(det.querySelectorAll(".v"), function(b){
@@ -498,7 +595,7 @@
         Array.prototype.forEach.call(det.querySelectorAll(".v"), function(o){
           o.setAttribute("aria-pressed", String(state[ref].v === o.dataset.v));
         });
-        record(state[ref].v ? "Kept on this page." : "Cleared.");
+        record("Saved.");
       });
     });
 
@@ -508,8 +605,8 @@
       t = setTimeout(function(){
         state[ref] = state[ref] || {v:null, note:""};
         state[ref].note = ta.value;
-        record("Kept on this page.");
-      }, 400);
+        record("Saved.");
+      }, 350);
     });
   }
 
@@ -530,20 +627,50 @@
     document.getElementById("fill").style.width = Math.round(done / order.length * 100) + "%";
   }
 
-  /* ---- extras persist too ---- */
+  /* ---- the two open boxes and the name ---- */
   var extra1 = document.getElementById("extra1"),
       extra2 = document.getElementById("extra2"),
       who    = document.getElementById("who");
-  var meta = state.__meta || {};
-  extra1.value = meta.extra1 || "";
-  extra2.value = meta.extra2 || "";
-  who.value    = meta.who || "";
-  [["extra1",extra1],["extra2",extra2],["who",who]].forEach(function(pair){
-    pair[1].addEventListener("input", function(){
-      state.__meta = state.__meta || {};
-      state.__meta[pair[0]] = pair[1].value;
-      save(); dirty();
+
+  function paintMeta(){
+    var meta = state.__meta || {};
+    if(document.activeElement !== extra1) extra1.value = meta.extra1 || "";
+    if(document.activeElement !== extra2) extra2.value = meta.extra2 || "";
+    if(document.activeElement !== who)    who.value    = meta.who || "";
+  }
+  paintMeta();
+
+  function bindMeta(el, field, ref){
+    var t;
+    el.addEventListener("input", function(){
+      clearTimeout(t);
+      t = setTimeout(function(){
+        state.__meta = state.__meta || {};
+        state.__meta[field] = el.value;
+        if(field === "extra1" || field === "extra2"){
+          state[ref] = {v:null, note:el.value};
+        }
+        saveLocal();
+        syncItem(ref);
+        resetSendState();
+      }, 400);
     });
+  }
+  bindMeta(extra1, "extra1", "X1");
+  bindMeta(extra2, "extra2", "X2");
+  bindMeta(who, "who", "X0");
+
+  /* ---- resume link ---- */
+  var resumeEl = document.getElementById("resume");
+  resumeEl.value = RESUME;
+  document.getElementById("copylink").addEventListener("click", function(){
+    resumeEl.removeAttribute("readonly");
+    resumeEl.select(); resumeEl.setSelectionRange(0, 99999);
+    var ok = false;
+    try { ok = document.execCommand("copy"); } catch(e){ ok = false; }
+    resumeEl.setAttribute("readonly", "");
+    if(!ok && navigator.clipboard){ navigator.clipboard.writeText(RESUME); ok = true; }
+    setStatus(ok ? "Link copied. Keep it somewhere safe." : "Select the link and copy it.", ok ? "good" : "");
   });
 
   /* ---- sending ---- */
@@ -551,37 +678,35 @@
       sendBtn  = document.getElementById("send"),
       outEl    = document.getElementById("out");
 
-  function dirty(){ statusEl.className = "status"; statusEl.textContent = ""; }
+  function setStatus(text, cls){ statusEl.className = "status" + (cls ? " " + cls : ""); statusEl.textContent = text; }
+  function resetSendState(){ if(statusEl.classList.contains("good")) setStatus(""); }
 
   function rows(){
-    var name = (who.value || "").trim() || "Not given";
+    var name = ((state.__meta && state.__meta.who) || "").trim() || "Not given";
     var list = [];
     order.forEach(function(r){
       var s = state[r];
       if(!s || (!s.v && !(s.note && s.note.trim()))) return;
       var it = byRef[r];
-      list.push({
-        author: name,
-        section: it.plateTitle,
-        item_ref: r,
-        item_title: it.title,
+      list.push({section: it.plateTitle, item_ref: r, item_title: it.title,
         verdict: s.v === "ok" ? "right" : (s.v === "no" ? "wrong" : "note"),
-        note: (s.note || "").trim() || null
-      });
+        note: (s.note || "").trim(), author: name});
     });
-    if((extra1.value || "").trim()){
-      list.push({author:name, section:"Anything else", item_ref:"X1", item_title:"Missed or wrong overall", verdict:"note", note:extra1.value.trim()});
-    }
-    if((extra2.value || "").trim()){
-      list.push({author:name, section:"Anything else", item_ref:"X2", item_title:"Other things you wanted", verdict:"note", note:extra2.value.trim()});
-    }
+    ["X1","X2"].forEach(function(r){
+      var s = state[r];
+      if(s && s.note && s.note.trim()){
+        list.push({section:"Anything else", item_ref:r,
+          item_title: r === "X1" ? "Missed or wrong overall" : "Other things you wanted",
+          verdict:"note", note:s.note.trim(), author:name});
+      }
+    });
     return list;
   }
 
   function asText(){
     var list = rows();
     if(!list.length) return "Nothing marked yet.";
-    var out = ["BADGER APP - NOTES FROM " + ((who.value||"").trim() || "?").toUpperCase(), new Date().toLocaleString("en-ZA"), ""];
+    var out = ["BADGER APP - NOTES FROM " + (list[0].author || "?").toUpperCase(), new Date().toLocaleString("en-ZA"), ""];
     var lastSection = "";
     list.forEach(function(r){
       if(r.section !== lastSection){ out.push(""); out.push("== " + r.section.toUpperCase() + " =="); lastSection = r.section; }
@@ -594,61 +719,34 @@
 
   sendBtn.addEventListener("click", function(){
     var list = rows();
-    if(!list.length){
-      statusEl.className = "status bad";
-      statusEl.textContent = "Nothing marked yet. Click a box above first.";
-      return;
-    }
+    if(!list.length){ setStatus("Nothing marked yet. Click a box above first.", "bad"); return; }
     sendBtn.disabled = true;
-    statusEl.className = "status";
-    statusEl.textContent = "Sending " + list.length + " note" + (list.length === 1 ? "" : "s") + "...";
-
-    fetch(SB + "/rest/v1/badger_scope_feedback", {
-      method: "POST",
-      headers: {
-        "apikey": KEY,
-        "Authorization": "Bearer " + KEY,
-        "Content-Type": "application/json",
-        "Prefer": "return=minimal"
-      },
-      body: JSON.stringify(list)
-    }).then(function(res){
-      sendBtn.disabled = false;
-      if(res.ok){
-        statusEl.className = "status good";
-        statusEl.textContent = "Sent. Thank you - we have them.";
+    setStatus("Sending...");
+    rpc("badger_scope_submit", {p_code: CODE, p_author: ((state.__meta && state.__meta.who) || "").trim() || null})
+      .then(function(n){
+        sendBtn.disabled = false;
+        if(!n){ throw new Error("nothing saved"); }
+        setStatus("Sent. Thank you, we have them. You can still change anything and send again.", "good");
         outEl.hidden = true;
-      } else {
-        throw new Error("HTTP " + res.status);
-      }
-    }).catch(function(){
-      sendBtn.disabled = false;
-      statusEl.className = "status bad";
-      statusEl.textContent = "That did not go through. Copy the text below and send it to Tarryn instead.";
-      outEl.value = asText();
-      outEl.hidden = false;
-    });
+      })
+      .catch(function(){
+        sendBtn.disabled = false;
+        setStatus("That did not go through. Copy the text below and send it to Tarryn instead.", "bad");
+        outEl.value = asText();
+        outEl.hidden = false;
+      });
   });
 
   document.getElementById("copy").addEventListener("click", function(){
     outEl.value = asText();
     outEl.hidden = false;
     outEl.removeAttribute("readonly");
-    outEl.select();
-    outEl.setSelectionRange(0, 99999);
+    outEl.select(); outEl.setSelectionRange(0, 99999);
     var ok = false;
     try { ok = document.execCommand("copy"); } catch(e){ ok = false; }
     outEl.setAttribute("readonly", "");
-    if(!ok && navigator.clipboard){
-      navigator.clipboard.writeText(outEl.value).then(function(){
-        statusEl.className = "status good"; statusEl.textContent = "Copied.";
-      }, function(){
-        statusEl.className = "status"; statusEl.textContent = "Select the text below and copy it.";
-      });
-    } else {
-      statusEl.className = ok ? "status good" : "status";
-      statusEl.textContent = ok ? "Copied." : "Select the text below and copy it.";
-    }
+    if(!ok && navigator.clipboard){ navigator.clipboard.writeText(outEl.value); ok = true; }
+    setStatus(ok ? "Copied." : "Select the text below and copy it.", ok ? "good" : "");
   });
 
   document.getElementById("jump").addEventListener("click", function(){
@@ -656,7 +754,30 @@
     document.getElementById("sendblock").scrollIntoView({behavior: reduce ? "auto" : "smooth", block:"start"});
   });
 
+  /* ---- bring back whatever the server already holds for this code ---- */
   tally();
+  setSaveState("Saved");
+  rpc("badger_scope_load", {p_code: CODE}).then(function(serverRows){
+    (serverRows || []).forEach(function(r){
+      var note = r.note || "";
+      if(r.author){ state.__meta = state.__meta || {}; state.__meta.who = state.__meta.who || r.author; }
+      if(r.item_ref === "X0") return;
+      var v = r.verdict === "right" ? "ok" : (r.verdict === "wrong" ? "no" : null);
+      state[r.item_ref] = {v: v, note: note};
+      if(r.item_ref === "X1" || r.item_ref === "X2"){
+        state.__meta = state.__meta || {};
+        state.__meta[r.item_ref === "X1" ? "extra1" : "extra2"] = note;
+      }
+    });
+    saveLocal();
+    paintMeta();
+    refreshMarks();
+    tally();
+    if(openRef){ var b = document.querySelector('[data-ref="' + openRef + '"]'); if(b){ var o = openRef; openRef = null; open(o, b); } }
+  }).catch(function(){
+    everFailed = true;
+    setSaveState("Saved on this device", true);
+  });
 })();
 </script>
 </body>
